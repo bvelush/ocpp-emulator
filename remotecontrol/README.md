@@ -2,9 +2,9 @@
 
 Drives a **running** `OcppEmulator` instance from an external test process — connect/
 disconnect a charge point, plug/unplug a simulated car, force a connector's status/error
-code — without clicking through the GUI. Built for CSMS teams who want to script charge
-point behavior from their own integration test suite (pytest, Pester, a CI shell script,
-...).
+code, start/stop a transaction (RFID-tap or plug-and-charge pattern) — without clicking
+through the GUI. Built for CSMS teams who want to script charge point behavior from their
+own integration test suite (pytest, Pester, a CI shell script, ...).
 
 This directory holds the two reference clients:
 
@@ -15,9 +15,8 @@ remotecontrol/
 ```
 
 Full design rationale and the open questions still under discussion live in
-[`docs/cli/cli-plan.md`](../docs/cli/cli-plan.md). Review history for this feature is in
-[`docs/cli/cli-code-review.md`](../docs/cli/cli-code-review.md). This README is the
-practical "how do I use it" companion to those two.
+[`remotecontrol-plan.md`](remotecontrol-plan.md). This README is the practical "how do I
+use it" companion to that doc.
 
 ## Why a socket, not a second CLI process or an HTTP API
 
@@ -36,7 +35,7 @@ newline-delimited JSON (NDJSON)**, bound to `127.0.0.1` only:
 - JSON avoids inventing an ad-hoc `key=value` escaping scheme for structured/optional
   params (`vendorId`, `info`, `forceUpdate`, ...).
 - Loopback-only because this is a local test-control channel, not a network service — see
-  open question 1 in `cli-plan.md` if that ever needs to cross a container boundary.
+  open question 1 in `remotecontrol-plan.md` if that ever needs to cross a container boundary.
 
 Every command is a thin dispatch onto **the exact function the corresponding GUI button
 already calls** (e.g. `connector.setCarState` → `ChargePointConnectorDAO.setConnectorCarState`,
@@ -119,8 +118,7 @@ no Compose, same as the domain and protocol layers.
   holding a connection open for a whole test run, can issue commands concurrently.
 - Per line in: parses to a raw Jackson tree first so a caller-supplied `id` can still be
   echoed back in the error response even when the JSON fails to bind to `ControlRequest`
-  (e.g. a well-formed object missing the required `command` field) — see finding #2 in
-  `cli-code-review.md`.
+  (e.g. a well-formed object missing the required `command` field).
 
 `ControlCommandDispatcher`:
 - One `dispatch(request)` entry point; catches `ControlCommandException` (mapped to its own
@@ -181,13 +179,62 @@ point); connectors by **position**, defaulting to `1` when omitted. Command cata
 | `chargePoint.getState` | `identity` | read-only |
 | `connector.setCarState` | `identity`, `connectorId?`, `carState` | `A`\|`B`\|`C` (Unplugged/Plugged/Ready) |
 | `connector.setStatus` | `identity`, `connectorId?`, `status`, `errorCode?`, `vendorId?`, `vendorErrorCode?`, `info?` | raw override, for fault injection |
-| `connector.authorize` | `identity`, `connectorId?`, `idTag` | starts/stops a transaction, like the RFID dialog |
+| `connector.authorize` | `identity`, `connectorId?`, `idTag` | Authorize.req first; if accepted, a separate StartTransaction.req — the RFID-tap pattern |
+| `connector.startTransaction` | `identity`, `connectorId?`, `idTag` | StartTransaction.req directly, no Authorize.req — the plug-and-charge/autocharge pattern |
 | `connector.stopTransaction` | `identity`, `connectorId?`, `reason?`, `endReasonDescription?` | |
 | `connector.getState` | `identity`, `connectorId?` | read-only |
 
 `status`/`errorCode`/`carState`/`reason` are the exact enum names from OCPP 1.6's
 `ChargePointStatus`/`ChargePointErrorCode`/`CarState`/`Reason` (e.g. `SuspendedEVSE`,
 `NoError`) — no remapping.
+
+### Authorize vs. startTransaction vs. stopTransaction — which OCPP flow each one is
+
+OCPP 1.6 gives a Charge Point two distinct ways to begin a transaction (§4.1/§4.8 of the
+spec), and this control socket exposes both as separate commands rather than picking one:
+
+- **`connector.authorize`** dispatches onto `ChargePointManager.authorize()` — the same
+  call the GUI's "Authorize" RFID dialog (`authorizeComponent`) makes. It sends an
+  `Authorize.req`/`.conf` round trip *first*; only if the CSMS accepts does it go on to
+  send a separate `StartTransaction.req`. This is the **RFID-tap pattern**: authorize
+  before physically plugging in (present the card, get a green light, then plug in).
+  Despite the RFID-dialog's own description text saying it can "start or stop" a
+  transaction, the code only ever starts one — it does not toggle a stop.
+- **`connector.startTransaction`** dispatches onto `ChargePointConnectorDAO.start()`
+  directly — no separate `Authorize.req`. This is the **plug-and-charge/autocharge
+  pattern**: plug in, the Charge Point reads whatever identifier the vehicle provides, and
+  a single `StartTransaction.req`/`.conf` round trip both authorizes and starts the
+  transaction (the transaction only actually starts if `.conf`'s `idTagInfo` is
+  `Accepted`). This same code path already runs automatically today when a charge point's
+  `FreeCharging` configuration key is enabled and a car is plugged in
+  (`ChargePointConnectorDAO.startFreeCharging()`) — `connector.startTransaction` is the
+  same mechanism, callable on demand with any `idTag` instead of only the configured
+  `FreeChargingIdTag`.
+- **`connector.stopTransaction`** dispatches onto `ChargePointConnectorDAO.stopActiveTransactions()`
+  — the same call the GUI's "Stop transaction" button (`ConnectorCard`) makes.
+
+**Both start commands are fully decided by the CSMS — neither uses a local list.** OCPP
+1.6 *permits* a Charge Point to authorize an identifier locally, without contacting the
+CSMS, via a Local Authorization List or Authorization Cache (spec §3.4) — but only as an
+*offline* fallback, gated by the `LocalAuthorizeOffline`/`LocalPreAuthorize` configuration
+keys. This emulator doesn't implement that path at all: its Local Authorization List
+handler (`ocpp/v16/profile/LocalAuthHandler.kt`) only *stores* whatever list the CSMS
+pushes down via `SendLocalList`, so it can answer `GetLocalListVersion` — it never
+*consults* that list to gate an outgoing `Authorize.req` or `StartTransaction.req`.
+`ChargePointManager.authorize()` and `ChargePointConnectorDAO.start()` both unconditionally
+round-trip to the CSMS and only proceed on an `Accepted` response, whether the charge
+point is "online" or not — so every authorization decision made through this control
+socket already comes from your CSMS, regardless of which of the two commands you use.
+
+**No VIN field, on either command.** OCPP 1.6's `AuthorizeRequest`/`StartTransactionRequest`
+carry only an `idTag` (string, ≤20 chars, per `com.monta.library.ocpp.v16.core` in
+`library-ocpp` v3.0.0) — there is no separate VIN field in the 1.6 protocol. If a real
+vehicle reports a VIN (or any other identifier) during a plug-and-charge sequence, that
+value travels to the CSMS as the `idTag` — there's nothing else it could be. The `vin`
+field that exists elsewhere in this codebase (`vehicle/model/EnodeVehicle.kt`) belongs to
+the unrelated Enode vehicle-telemetry simulation, not to charge-session authorization. So
+to simulate a car presenting its VIN, pass that VIN string as `idTag` to
+`connector.startTransaction`.
 
 ## Python: `ocpp_emulator_remote_control`
 
@@ -208,9 +255,21 @@ from ocpp_emulator_remote_control import ControlClient
 
 with ControlClient(host="127.0.0.1", port=9911, timeout=15.0) as client:
     client.connect("CP001")
+
+    # RFID-tap pattern: authorize (Authorize.req) before plugging in.
+    client.authorize("CP001", id_tag="DEADBEEF", connector_id=1)
     client.plug("CP001", connector_id=1)          # CarState "C" — plugged in and ready
+
     client.set_connector_status("CP001", connector_id=1, error="OverVoltage")
+    client.stop_transaction("CP001", connector_id=1)
     client.unplug("CP001", connector_id=1)         # CarState "A"
+
+    # Plug-and-charge/autocharge pattern: plug in, then a single StartTransaction round
+    # trip both authorizes (server-decided) and starts - no separate Authorize.req.
+    client.plug("CP001", connector_id=1)
+    client.start_transaction("CP001", id_tag="VIN-1FTFW1E5XNKE12345", connector_id=1)
+    client.stop_transaction("CP001", connector_id=1)
+
     client.disconnect("CP001")
 ```
 
@@ -225,9 +284,25 @@ are independent, pass either or both; whichever is omitted is read from the conn
 current state first and resent unchanged (matches the GUI dialog's pre-fill behavior).
 `status`/`error` values are matched case-insensitively against the OCPP enum names and
 normalized before being sent. `get_connector_status(identity, connector_id=1)` — read-only
-counterpart, returns the connector's current `status`/`errorCode`/`carState`/etc. Any other
-command from the catalog above can be issued with the low-level `send(command, **params)`,
-which returns the parsed `result` dict and raises `RuntimeError` on an error response.
+counterpart, returns the connector's current `status`/`errorCode`/`carState`/etc.
+`authorize(identity, id_tag, connector_id=1)` — Authorize.req first, then, if accepted, a
+separate StartTransaction.req (the GUI's "Authorize" RFID dialog; the RFID-tap pattern —
+authorize *before* plugging in); returns a dict with the resulting `status`
+(`Accepted`/`Blocked`/`Expired`/`Invalid`/`ConcurrentTx`).
+`start_transaction(identity, id_tag, connector_id=1)` — StartTransaction.req directly, no
+separate Authorize.req (the plug-and-charge/autocharge pattern — plug in, the Charge Point
+reads whatever identifier the vehicle provides, and a single round trip both authorizes
+and starts); returns a dict with the connector's resulting state (`activeTransactionId` is
+set when accepted). Both `authorize` and `start_transaction` are fully decided by the
+CSMS's response and neither has a VIN parameter — OCPP 1.6 doesn't carry one; whatever
+identifier the vehicle reports (VIN or otherwise) travels as `id_tag`; see the
+wire-protocol note above.
+`stop_transaction(identity, connector_id=1, reason=None, end_reason_description=None)` —
+stops the connector's active transaction (the GUI's "Stop transaction" button); `reason`
+defaults server-side to `"Local"` when omitted and is matched case-insensitively against
+OCPP's `Reason` enum when given. Any other command from the catalog above can be issued
+with the low-level `send(command, **params)`, which returns the parsed `result` dict and
+raises `RuntimeError` on an error response.
 
 ### CLI
 
@@ -240,6 +315,10 @@ python remotecontrol.py unplug CP001:2
 python remotecontrol.py set-connector-status CP001:2 --status Faulted --error NoError
 python remotecontrol.py set-connector-status CP001:2 --error OverVoltage   # --status/--error independent
 python remotecontrol.py get-connector-status CP001:2
+python remotecontrol.py authorize CP001:2 --id-tag DEADBEEF                # RFID-tap: Authorize.req then StartTransaction.req
+python remotecontrol.py start-transaction CP001:2 --id-tag VIN-1FTFW1E5XNKE12345   # plug-and-charge: StartTransaction.req only
+python remotecontrol.py stop-transaction CP001:2
+python remotecontrol.py stop-transaction CP001:2 --reason EVDisconnected
 ```
 
 Global options: `--host` (default `127.0.0.1`), `--port` (default `9911`). Charge
@@ -257,9 +336,21 @@ Import-Module remotecontrol\powershell\OcppEmulatorRemoteControl.psd1
 $client = New-OcppControlClient -ComputerName '127.0.0.1' -Port 9911 -TimeoutSec 15
 try {
     Connect-OcppChargePoint -Client $client -Identity 'CP001'
+
+    # RFID-tap pattern: authorize (Authorize.req) before plugging in.
+    Invoke-OcppAuthorize -Client $client -Identity 'CP001' -ConnectorId 1 -IdTag 'DEADBEEF'
     Set-OcppConnectorReady -Client $client -Identity 'CP001' -ConnectorId 1      # CarState "C"
+
     Set-OcppConnectorStatus -Client $client -Identity 'CP001' -ConnectorId 1 -ErrorCode 'OverVoltage'
+    Stop-OcppTransaction -Client $client -Identity 'CP001' -ConnectorId 1
     Set-OcppConnectorUnplugged -Client $client -Identity 'CP001' -ConnectorId 1  # CarState "A"
+
+    # Plug-and-charge/autocharge pattern: plug in, then a single StartTransaction round
+    # trip both authorizes (server-decided) and starts - no separate Authorize.req.
+    Set-OcppConnectorReady -Client $client -Identity 'CP001' -ConnectorId 1
+    Start-OcppTransaction -Client $client -Identity 'CP001' -ConnectorId 1 -IdTag 'VIN-1FTFW1E5XNKE12345'
+    Stop-OcppTransaction -Client $client -Identity 'CP001' -ConnectorId 1
+
     Disconnect-OcppChargePoint -Client $client -Identity 'CP001'
 } finally {
     Close-OcppControlClient -Client $client
@@ -280,7 +371,21 @@ escape hatch for any command in the catalog),
 (`-Status`/`-ErrorCode` independent, same pre-fill behavior as the Python client;
 case-insensitive against the OCPP enum names),
 `Get-OcppConnectorStatus -Client <client> -Identity <string> [-ConnectorId <int>]`
-(read-only counterpart to `Set-OcppConnectorStatus`).
+(read-only counterpart to `Set-OcppConnectorStatus`),
+`Invoke-OcppAuthorize -Client <client> -Identity <string> [-ConnectorId <int>] -IdTag <string>`
+(Authorize.req first, then, if accepted, a separate StartTransaction.req — the GUI's
+"Authorize" RFID dialog; the RFID-tap pattern, authorize *before* plugging in),
+`Start-OcppTransaction -Client <client> -Identity <string> [-ConnectorId <int>] -IdTag <string>`
+(StartTransaction.req directly, no separate Authorize.req — the plug-and-charge/autocharge
+pattern: plug in, the Charge Point reads whatever identifier the vehicle provides, and a
+single round trip both authorizes and starts). Both are fully decided by the CSMS's
+response and neither has a VIN parameter — OCPP 1.6 doesn't carry one; whatever identifier
+the vehicle reports (VIN or otherwise) travels as `-IdTag`; see the wire-protocol note
+above.
+`Stop-OcppTransaction -Client <client> -Identity <string> [-ConnectorId <int>] [-Reason <string>] [-EndReasonDescription <string>]`
+(stops the connector's active transaction — the GUI's "Stop transaction" button; `-Reason`
+defaults server-side to `Local` when omitted, case-insensitive against OCPP's `Reason` enum
+when given).
 
 ### CLI
 
@@ -293,12 +398,18 @@ case-insensitive against the OCPP enum names),
 .\remotecontrol.ps1 set-connector-status CP001:2 -Status Faulted -ErrorCode NoError
 .\remotecontrol.ps1 set-connector-status CP001:2 -ErrorCode OverVoltage
 .\remotecontrol.ps1 get-connector-status CP001:2
+.\remotecontrol.ps1 authorize CP001:2 -IdTag DEADBEEF
+.\remotecontrol.ps1 start-transaction CP001:2 -IdTag VIN-1FTFW1E5XNKE12345
+.\remotecontrol.ps1 stop-transaction CP001:2
+.\remotecontrol.ps1 stop-transaction CP001:2 -Reason EVDisconnected
 ```
 
-Params: `-Action <hello|connect|disconnect|plug|unplug|set-connector-status|get-connector-status>`
+Params: `-Action <hello|connect|disconnect|plug|unplug|set-connector-status|get-connector-status|authorize|start-transaction|stop-transaction>`
 (positional), `-Target <string>` (positional; identity for `connect`/`disconnect`, `CP` or
-`CP:connector` for `plug`/`unplug`/`set-connector-status`/`get-connector-status`), `-Status`,
-`-ErrorCode`, `-ComputerName` (default `127.0.0.1`), `-Port` (default `9911`).
+`CP:connector` for `plug`/`unplug`/`set-connector-status`/`get-connector-status`/`authorize`/
+`start-transaction`/`stop-transaction`), `-Status`, `-ErrorCode`, `-IdTag` (required for
+`authorize`/`start-transaction`; no VIN equivalent — OCPP 1.6 has none), `-Reason`,
+`-EndReasonDescription`, `-ComputerName` (default `127.0.0.1`), `-Port` (default `9911`).
 
 ## End-to-end example
 
@@ -308,15 +419,26 @@ Params: `-Action <hello|connect|disconnect|plug|unplug|set-connector-status|get-
 
 # from another shell, once a charge point named CP001 exists in that DB
 python remotecontrol/python/remotecontrol.py connect CP001
+
+# RFID-tap pattern: authorize before plugging in
+python remotecontrol/python/remotecontrol.py authorize CP001 --id-tag DEADBEEF
 python remotecontrol/python/remotecontrol.py plug CP001
 python remotecontrol/python/remotecontrol.py set-connector-status CP001 --error OverVoltage
 python remotecontrol/python/remotecontrol.py get-connector-status CP001
+python remotecontrol/python/remotecontrol.py stop-transaction CP001
+python remotecontrol/python/remotecontrol.py unplug CP001
+
+# plug-and-charge/autocharge pattern: single StartTransaction round trip, server-decided
+python remotecontrol/python/remotecontrol.py plug CP001
+python remotecontrol/python/remotecontrol.py start-transaction CP001 --id-tag VIN-1FTFW1E5XNKE12345
+python remotecontrol/python/remotecontrol.py stop-transaction CP001
+
 python remotecontrol/python/remotecontrol.py disconnect CP001
 ```
 
 ## Not yet covered
 
-Deliberately out of scope for this MVP (see `cli-plan.md` §12): authentication (loopback
+Deliberately out of scope for this MVP (see `remotecontrol-plan.md` §12): authentication (loopback
 trust boundary only), a headless launch mode, and the phase-2 command catalog (firmware
 status, security events, raw message injection, interceptor rule configuration). All are
 cheap to add later — every command is the same shape (thin dispatch onto an existing

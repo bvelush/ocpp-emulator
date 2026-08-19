@@ -17,7 +17,10 @@
         'Set-OcppConnectorReady',
         'Set-OcppConnectorUnplugged',
         'Set-OcppConnectorStatus',
-        'Get-OcppConnectorStatus'
+        'Get-OcppConnectorStatus',
+        'Invoke-OcppAuthorize',
+        'Start-OcppTransaction',
+        'Stop-OcppTransaction'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()
